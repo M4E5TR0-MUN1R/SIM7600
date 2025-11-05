@@ -1,5 +1,7 @@
 # SIM7600 MQTT - How It Actually Works
 
+> **📦 FreeRTOS Version**: This project now includes a **FreeRTOS multi-tasking implementation** with concurrent publish/receive/watchdog tasks. See [FREERTOS_ARCHITECTURE.md](FREERTOS_ARCHITECTURE.md) for details.
+
 ## The Key Discovery
 
 After struggling with complex network setup commands (`AT+NETOPEN`, `AT+CIPSHUT`, `AT+CIICR`, etc.), we discovered that the SIM7600 MQTT implementation is **surprisingly simple**.

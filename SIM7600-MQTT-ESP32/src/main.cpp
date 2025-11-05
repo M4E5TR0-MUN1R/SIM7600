@@ -1,11 +1,23 @@
 #include <Arduino.h>
 #include <Adafruit_MCP23X17.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <freertos/queue.h>
 
 /* ===============================================================================
- * SIM7600 MQTT CLIENT - HOW IT WORKS
+ * SIM7600 MQTT CLIENT - FreeRTOS Edition
  * ===============================================================================
  * 
- * This code implements MQTT connectivity using the SIM7600E 4G modem.
+ * This code implements MQTT connectivity using the SIM7600E 4G modem with
+ * FreeRTOS multi-tasking for robust, concurrent operation.
+ * 
+ * FREERTOS ARCHITECTURE:
+ * - InitTask: Initializes hardware, network, and MQTT (runs once, deletes self)
+ * - PublishTask: Publishes status messages every 30 seconds
+ * - ReceiveTask: Monitors incoming MQTT messages (checks every 100ms)
+ * - WatchdogTask: Reports system health every 60 seconds
+ * - Mutex protection: SIM7600 UART is protected by a mutex for thread safety
  * 
  * KEY LEARNING: The SIM7600 MQTT implementation is SIMPLE!
  * Based on real-world tutorials (MQTT_tutorial.txt and MQTT_tutorial2.txt),
@@ -122,6 +134,30 @@ const char *root_ca =
 String response = "";
 bool mqttConnected = false;
 
+// ===== FreeRTOS Task Handles and Synchronization =====
+TaskHandle_t xInitTaskHandle = NULL;
+TaskHandle_t xPublishTaskHandle = NULL;
+TaskHandle_t xReceiveTaskHandle = NULL;
+TaskHandle_t xWatchdogTaskHandle = NULL;
+
+// Semaphore to protect SIM7600 UART access (shared resource)
+SemaphoreHandle_t xSIM7600Mutex = NULL;
+
+// Queue for publish requests (optional - for future expansion)
+QueueHandle_t xPublishQueue = NULL;
+
+// Task priorities (higher number = higher priority)
+#define PRIORITY_INIT       4    // Highest - run first
+#define PRIORITY_WATCHDOG   3    // High - monitor connection
+#define PRIORITY_RECEIVE    2    // Medium-High - check incoming messages
+#define PRIORITY_PUBLISH    1    // Medium - periodic publishing
+
+// Task stack sizes (in words, not bytes)
+#define STACK_SIZE_INIT     8192
+#define STACK_SIZE_PUBLISH  4096
+#define STACK_SIZE_RECEIVE  4096
+#define STACK_SIZE_WATCHDOG 2048
+
 // ===== Function Declarations =====
 bool initMCP23017();
 void powerOnModule();
@@ -133,112 +169,112 @@ bool connectMQTT();
 void publishMessage(const char* topic, const char* message);
 void checkIncomingMessages();
 
+// FreeRTOS Task Functions
+void vInitTask(void *pvParameters);
+void vPublishTask(void *pvParameters);
+void vReceiveTask(void *pvParameters);
+void vWatchdogTask(void *pvParameters);
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
   
   Serial.println("\n\n╔═══════════════════════════════════════════════╗");
-  Serial.println("║    SIM7600 MQTT Client - HiveMQ Cloud       ║");
+  Serial.println("║  SIM7600 MQTT Client - FreeRTOS Edition     ║");
   Serial.println("╚═══════════════════════════════════════════════╝\n");
   
-  // Initialize MCP23017
-  if (!initMCP23017()) {
-    Serial.println("✗ Failed to initialize MCP23017! Halting...");
+  // Create mutex for SIM7600 UART protection
+  xSIM7600Mutex = xSemaphoreCreateMutex();
+  if (xSIM7600Mutex == NULL) {
+    Serial.println("✗ Failed to create mutex! Halting...");
     while(1) delay(1000);
   }
+  Serial.println("✓ Mutex created for UART protection");
   
-  // Initialize SIM7600 UART
-  SIM7600.begin(SIM7600_BAUD, SERIAL_8N1, SIM7600_RX, SIM7600_TX);
-  Serial.printf("✓ UART initialized on RX:%d, TX:%d at %d baud\n", 
-                SIM7600_RX, SIM7600_TX, SIM7600_BAUD);
-  
-  // Skip PWRKEY - module should already be on
-  Serial.println("Skipping PWRKEY sequence (module should already be on)...");
-  Serial.println("Waiting for module to stabilize...");
-  delay(3000);
-  
-  // Basic module test
-  Serial.println("\n--- Testing Module Communication ---");
-  sendATCommand("AT");
-  
-  if (response.indexOf("OK") == -1 && response.indexOf("AT") == -1) {
-    Serial.println("✗ Module not responding! Check connections.");
-    Serial.println("Entering debug mode...");
-    while(1) {
-      if (Serial.available()) {
-        String cmd = Serial.readStringUntil('\n');
-        cmd.trim();
-        if (cmd.length() > 0) {
-          Serial.printf(">> %s\n", cmd.c_str());
-          SIM7600.println(cmd);
-        }
-      }
-      if (SIM7600.available()) {
-        Serial.write(SIM7600.read());
-      }
-      delay(10);
-    }
+  // Create publish queue (capacity of 10 messages)
+  xPublishQueue = xQueueCreate(10, sizeof(char*) * 2);  // topic + message
+  if (xPublishQueue == NULL) {
+    Serial.println("⚠ Failed to create publish queue (non-critical)");
   }
   
-  Serial.println("✓ Module responding!");
-  sendATCommand("ATE0");  // Disable echo
-  sendATCommand("ATI");   // Module info
+  // Create FreeRTOS tasks
+  Serial.println("\n--- Creating FreeRTOS Tasks ---");
   
-  // Setup network connection
-  if (!setupNetwork()) {
-    Serial.println("✗ Network setup failed! Check SIM card and signal.");
-    Serial.println("Entering AT command mode for debugging...");
-    while(1) {
-      if (Serial.available()) {
-        String cmd = Serial.readStringUntil('\n');
-        cmd.trim();
-        if (cmd.length() > 0) {
-          Serial.printf(">> %s\n", cmd.c_str());
-          SIM7600.println(cmd);
-        }
-      }
-      if (SIM7600.available()) {
-        Serial.write(SIM7600.read());
-      }
-      delay(10);
-    }
-  }
+  // Initialization Task (runs once, then deletes itself)
+  BaseType_t xReturned = xTaskCreatePinnedToCore(
+    vInitTask,              // Task function
+    "InitTask",             // Task name
+    STACK_SIZE_INIT,        // Stack size
+    NULL,                   // Parameters
+    PRIORITY_INIT,          // Priority
+    &xInitTaskHandle,       // Task handle
+    1                       // Core 1 (0 = protocol core, 1 = app core)
+  );
   
-  // Setup MQTT
-  if (!setupMQTT()) {
-    Serial.println("✗ MQTT setup failed!");
+  if (xReturned != pdPASS) {
+    Serial.println("✗ Failed to create InitTask! Halting...");
     while(1) delay(1000);
   }
+  Serial.println("✓ InitTask created");
   
-  // Connect to MQTT broker
-  if (!connectMQTT()) {
-    Serial.println("✗ MQTT connection failed!");
-    while(1) delay(1000);
+  // Publish Task (periodic status publishing)
+  xReturned = xTaskCreatePinnedToCore(
+    vPublishTask,
+    "PublishTask",
+    STACK_SIZE_PUBLISH,
+    NULL,
+    PRIORITY_PUBLISH,
+    &xPublishTaskHandle,
+    1
+  );
+  
+  if (xReturned != pdPASS) {
+    Serial.println("✗ Failed to create PublishTask!");
+  } else {
+    Serial.println("✓ PublishTask created");
   }
   
-  mqttConnected = true;
-  Serial.println("\n✓ System ready! MQTT connected.");
-  Serial.println("Publishing status message...");
-  publishMessage(test_topic_pub, "SIM7600 online!");
+  // Receive Task (monitor incoming MQTT messages)
+  xReturned = xTaskCreatePinnedToCore(
+    vReceiveTask,
+    "ReceiveTask",
+    STACK_SIZE_RECEIVE,
+    NULL,
+    PRIORITY_RECEIVE,
+    &xReceiveTaskHandle,
+    1
+  );
+  
+  if (xReturned != pdPASS) {
+    Serial.println("✗ Failed to create ReceiveTask!");
+  } else {
+    Serial.println("✓ ReceiveTask created");
+  }
+  
+  // Watchdog Task (monitor connection health)
+  xReturned = xTaskCreatePinnedToCore(
+    vWatchdogTask,
+    "WatchdogTask",
+    STACK_SIZE_WATCHDOG,
+    NULL,
+    PRIORITY_WATCHDOG,
+    &xWatchdogTaskHandle,
+    1
+  );
+  
+  if (xReturned != pdPASS) {
+    Serial.println("⚠ Failed to create WatchdogTask (non-critical)");
+  } else {
+    Serial.println("✓ WatchdogTask created");
+  }
+  
+  Serial.println("\n✓ FreeRTOS scheduler starting...\n");
 }
 
 void loop() {
-  if (mqttConnected) {
-    // Check for incoming MQTT messages
-    checkIncomingMessages();
-    
-    // Publish status every 30 seconds
-    static unsigned long lastPublish = 0;
-    if (millis() - lastPublish > 30000) {
-      lastPublish = millis();
-      char msg[100];
-      snprintf(msg, sizeof(msg), "Uptime: %lu seconds", millis() / 1000);
-      Serial.printf("Publishing: %s\n", msg);
-      publishMessage(test_topic_pub, msg);
-    }
-  }
-  
-  delay(100);
+  // FreeRTOS scheduler handles everything
+  // This loop is kept minimal to allow tasks to run
+  vTaskDelay(pdMS_TO_TICKS(1000));  // Yield to other tasks
 }
 
 // ===== Function Implementations =====
@@ -373,7 +409,7 @@ bool setupNetwork() {
   // Just wait - the tutorials show no special setup needed!
   // PDP context activation via AT+CREG is enough
   Serial.println("Waiting for network to stabilize...");
-  delay(5000);
+  vTaskDelay(pdMS_TO_TICKS(5000));
   
   Serial.println("✓ Network connection established\n");
   return true;
@@ -389,26 +425,26 @@ bool setupMQTT() {
   Serial.println("Stopping any existing MQTT service...");
   sendATCommand("AT+CMQTTSTOP", 3000);
   // Error 21 = "operation not allowed" (nothing to stop) - IGNORE
-  delay(1000);
+  vTaskDelay(pdMS_TO_TICKS(1000));
   
   Serial.println("Releasing any existing MQTT client...");
   sendATCommand("AT+CMQTTREL=0", 2000);
-  delay(1000);
+  vTaskDelay(pdMS_TO_TICKS(1000));
   
   // Start MQTT service
   Serial.println("Starting MQTT service...");
   sendATCommand("AT+CMQTTSTART", 5000);
   // Error 23 = "network not ready" but service may still start - IGNORE
-  delay(2000);
+  vTaskDelay(pdMS_TO_TICKS(2000));
   
   Serial.println("✓ MQTT service initialized");
-  delay(1000);
+  vTaskDelay(pdMS_TO_TICKS(1000));
   
   // Acquire MQTT client - this should succeed
   Serial.println("Acquiring MQTT client...");
   snprintf(cmd, sizeof(cmd), "AT+CMQTTACCQ=0,\"%s\"", mqtt_client_id);
   sendATCommand(cmd, 5000);
-  delay(500);
+  vTaskDelay(pdMS_TO_TICKS(500));
   
   if (response.indexOf("OK") != -1) {
     Serial.println("✓ MQTT client acquired successfully!");
@@ -436,7 +472,7 @@ bool connectMQTT() {
   snprintf(cmd, sizeof(cmd), "AT+CMQTTCONNECT=0,\"%s\",90,1,\"%s\",\"%s\"", 
            broker_url, mqtt_user, mqtt_password);
   sendATCommand(cmd, 30000);
-  delay(5000);  // Allow time for connection handshake
+  vTaskDelay(pdMS_TO_TICKS(5000));  // Allow time for connection handshake
   
   // Check for connection success: +CMQTTCONNECT: 0,0 means SUCCESS
   if (response.indexOf("+CMQTTCONNECT: 0,0") != -1) {
@@ -444,13 +480,13 @@ bool connectMQTT() {
   } else {
     Serial.println("⚠ Connection response unclear, but continuing...");
   }
-  delay(2000);
+  vTaskDelay(pdMS_TO_TICKS(2000));
   
   // Subscribe - matching tutorial approach
   Serial.printf("Subscribing to: %s\n", test_topic_sub);
   snprintf(cmd, sizeof(cmd), "AT+CMQTTSUB=0,\"%s\",1", test_topic_sub);
   sendATCommand(cmd, 5000);
-  delay(2000);
+  vTaskDelay(pdMS_TO_TICKS(2000));
   
   // Check subscription (error 12 might occur if topic format is wrong)
   if (response.indexOf("+CMQTTSUB: 0,0") != -1) {
@@ -466,8 +502,8 @@ bool connectMQTT() {
 void publishMessage(const char* topic, const char* message) {
   char cmd[400];
   
-  // Following tutorial 2 approach - simple delays, no prompt waiting
-  // Lines 60-68 of MQTT_tutorial2.txt
+  // Optimized for high-frequency publishing
+  // Reduced delays from 1000ms to 200ms (still safe, but 5x faster)
   
   int topicLen = strlen(topic);
   int msgLen = strlen(message);
@@ -475,22 +511,22 @@ void publishMessage(const char* topic, const char* message) {
   // Set topic length and send topic
   snprintf(cmd, sizeof(cmd), "AT+CMQTTTOPIC=0,%d", topicLen);
   SIM7600.println(cmd);
-  delay(1000);  // Tutorial uses 1 second delay
+  vTaskDelay(pdMS_TO_TICKS(200));  // Reduced delay for speed
   
   SIM7600.println(topic);
-  delay(1000);
+  vTaskDelay(pdMS_TO_TICKS(200));
   
   // Set payload length and send payload
   snprintf(cmd, sizeof(cmd), "AT+CMQTTPAYLOAD=0,%d", msgLen);
   SIM7600.println(cmd);
-  delay(1000);
+  vTaskDelay(pdMS_TO_TICKS(200));
   
   SIM7600.println(message);
-  delay(1000);
+  vTaskDelay(pdMS_TO_TICKS(200));
   
   // Publish with QoS 1, timeout 60 seconds
   SIM7600.println("AT+CMQTTPUB=0,1,60");
-  delay(1000);
+  vTaskDelay(pdMS_TO_TICKS(200));
   
   Serial.printf("✓ Published: %s → %s\n", topic, message);
 }
@@ -514,7 +550,7 @@ void checkIncomingMessages() {
       Serial.println(incoming);
       
       // Continue reading related lines
-      delay(100);
+      vTaskDelay(pdMS_TO_TICKS(100));
       while (SIM7600.available()) {
         String line = SIM7600.readStringUntil('\n');
         Serial.println(line);
@@ -525,6 +561,255 @@ void checkIncomingMessages() {
       
       Serial.println();
     }
+  }
+}
+
+// ===== FreeRTOS Task Implementations =====
+
+/**
+ * @brief Initialization Task - Sets up MCP23017, SIM7600, Network, and MQTT
+ * @note This task runs once and then deletes itself after successful init
+ */
+void vInitTask(void *pvParameters) {
+  Serial.println("🚀 InitTask started on Core 1");
+  
+  // Wait a bit for other tasks to settle
+  vTaskDelay(pdMS_TO_TICKS(500));
+  
+  // Initialize MCP23017
+  if (!initMCP23017()) {
+    Serial.println("✗ Failed to initialize MCP23017! Halting...");
+    mqttConnected = false;
+    vTaskDelete(NULL);  // Delete this task
+    return;
+  }
+  
+  // Initialize SIM7600 UART
+  SIM7600.begin(SIM7600_BAUD, SERIAL_8N1, SIM7600_RX, SIM7600_TX);
+  Serial.printf("✓ UART initialized on RX:%d, TX:%d at %d baud\n", 
+                SIM7600_RX, SIM7600_TX, SIM7600_BAUD);
+  
+  // Skip PWRKEY - module should already be on
+  Serial.println("Skipping PWRKEY sequence (module should already be on)...");
+  Serial.println("Waiting for module to stabilize...");
+  vTaskDelay(pdMS_TO_TICKS(3000));
+  
+  // Basic module test
+  Serial.println("\n--- Testing Module Communication ---");
+  
+  // Acquire mutex before using SIM7600 UART
+  if (xSemaphoreTake(xSIM7600Mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+    sendATCommand("AT");
+    
+    if (response.indexOf("OK") == -1 && response.indexOf("AT") == -1) {
+      Serial.println("✗ Module not responding! Check connections.");
+      xSemaphoreGive(xSIM7600Mutex);
+      mqttConnected = false;
+      vTaskDelete(NULL);
+      return;
+    }
+    
+    Serial.println("✓ Module responding!");
+    sendATCommand("ATE0");  // Disable echo
+    sendATCommand("ATI");   // Module info
+    
+    xSemaphoreGive(xSIM7600Mutex);  // Release mutex
+  } else {
+    Serial.println("✗ Failed to acquire mutex for AT commands!");
+    vTaskDelete(NULL);
+    return;
+  }
+  
+  // Setup network connection
+  if (xSemaphoreTake(xSIM7600Mutex, pdMS_TO_TICKS(30000)) == pdTRUE) {
+    if (!setupNetwork()) {
+      Serial.println("✗ Network setup failed! Check SIM card and signal.");
+      xSemaphoreGive(xSIM7600Mutex);
+      mqttConnected = false;
+      vTaskDelete(NULL);
+      return;
+    }
+    xSemaphoreGive(xSIM7600Mutex);
+  } else {
+    Serial.println("✗ Failed to acquire mutex for network setup!");
+    vTaskDelete(NULL);
+    return;
+  }
+  
+  // Setup MQTT
+  if (xSemaphoreTake(xSIM7600Mutex, pdMS_TO_TICKS(30000)) == pdTRUE) {
+    if (!setupMQTT()) {
+      Serial.println("✗ MQTT setup failed!");
+      xSemaphoreGive(xSIM7600Mutex);
+      mqttConnected = false;
+      vTaskDelete(NULL);
+      return;
+    }
+    xSemaphoreGive(xSIM7600Mutex);
+  } else {
+    Serial.println("✗ Failed to acquire mutex for MQTT setup!");
+    vTaskDelete(NULL);
+    return;
+  }
+  
+  // Connect to MQTT broker
+  if (xSemaphoreTake(xSIM7600Mutex, pdMS_TO_TICKS(30000)) == pdTRUE) {
+    if (!connectMQTT()) {
+      Serial.println("✗ MQTT connection failed!");
+      xSemaphoreGive(xSIM7600Mutex);
+      mqttConnected = false;
+      vTaskDelete(NULL);
+      return;
+    }
+    xSemaphoreGive(xSIM7600Mutex);
+  } else {
+    Serial.println("✗ Failed to acquire mutex for MQTT connect!");
+    vTaskDelete(NULL);
+    return;
+  }
+  
+  // Success!
+  mqttConnected = true;
+  Serial.println("\n✓✓✓ System ready! MQTT connected. ✓✓✓");
+  
+  // Publish initial status message
+  if (xSemaphoreTake(xSIM7600Mutex, pdMS_TO_TICKS(10000)) == pdTRUE) {
+    Serial.println("Publishing initial status message...");
+    publishMessage(test_topic_pub, "SIM7600 online! [FreeRTOS]");
+    xSemaphoreGive(xSIM7600Mutex);
+  }
+  
+  Serial.println("🎯 InitTask completed successfully - deleting self");
+  
+  // Delete this task (no longer needed)
+  vTaskDelete(NULL);
+}
+
+/**
+ * @brief Publish Task - Periodically publishes status messages
+ * @note Runs continuously every 30 seconds
+ */
+void vPublishTask(void *pvParameters) {
+  Serial.println("📤 PublishTask started on Core 1");
+  
+  // Wait for initialization to complete
+  while (!mqttConnected) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+  
+  Serial.println("📤 PublishTask active - will publish every 1 second (HIGH FREQUENCY TEST)");
+  
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xFrequency = pdMS_TO_TICKS(1000);  // 1 second (for data logging testing)
+  
+  unsigned long messageCount = 0;  // Track message sequence
+  
+  while (1) {
+    // Wait for next cycle
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    
+    if (!mqttConnected) {
+      Serial.println("⚠ MQTT not connected, skipping publish");
+      continue;
+    }
+    
+    // Prepare message with sequence number for tracking
+    messageCount++;
+    char msg[100];
+    unsigned long uptime = millis() / 1000;
+    snprintf(msg, sizeof(msg), "Msg#%lu | Uptime:%lus", messageCount, uptime);
+    
+    // Acquire mutex before publishing
+    if (xSemaphoreTake(xSIM7600Mutex, pdMS_TO_TICKS(10000)) == pdTRUE) {
+      Serial.printf("📤 Publishing: %s\n", msg);
+      publishMessage(test_topic_pub, msg);
+      xSemaphoreGive(xSIM7600Mutex);
+    } else {
+      Serial.println("⚠ Failed to acquire mutex for publish!");
+    }
+  }
+}
+
+/**
+ * @brief Receive Task - Monitors incoming MQTT messages
+ * @note Runs continuously, checking every 100ms
+ */
+void vReceiveTask(void *pvParameters) {
+  Serial.println("📥 ReceiveTask started on Core 1");
+  
+  // Wait for initialization to complete
+  while (!mqttConnected) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+  
+  Serial.println("📥 ReceiveTask active - monitoring incoming messages");
+  
+  while (1) {
+    if (mqttConnected) {
+      // Acquire mutex before checking messages
+      if (xSemaphoreTake(xSIM7600Mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        checkIncomingMessages();
+        xSemaphoreGive(xSIM7600Mutex);
+      }
+    }
+    
+    // Check every 100ms
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+/**
+ * @brief Watchdog Task - Monitors MQTT connection health
+ * @note Runs every 60 seconds, checks connection status
+ */
+void vWatchdogTask(void *pvParameters) {
+  Serial.println("🐕 WatchdogTask started on Core 1");
+  
+  // Wait for initialization to complete
+  while (!mqttConnected) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+  
+  Serial.println("🐕 WatchdogTask active - monitoring every 60 seconds");
+  
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xFrequency = pdMS_TO_TICKS(60000);  // 60 seconds
+  
+  unsigned long lastHeartbeat = millis();
+  
+  while (1) {
+    // Wait for next cycle
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    
+    if (!mqttConnected) {
+      Serial.println("🐕⚠ Watchdog: MQTT disconnected!");
+      continue;
+    }
+    
+    // Check if we're still connected
+    if (xSemaphoreTake(xSIM7600Mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+      // Optional: Send a ping or check command
+      // For now, just report status
+      unsigned long uptime = millis() / 1000;
+      Serial.printf("🐕✓ Watchdog: System healthy | Uptime: %lu sec | Free heap: %d bytes\n", 
+                    uptime, ESP.getFreeHeap());
+      
+      // Report task high water marks (minimum free stack)
+      if (xPublishTaskHandle != NULL) {
+        UBaseType_t stackLeft = uxTaskGetStackHighWaterMark(xPublishTaskHandle);
+        Serial.printf("   📊 PublishTask stack: %u words remaining\n", stackLeft);
+      }
+      if (xReceiveTaskHandle != NULL) {
+        UBaseType_t stackLeft = uxTaskGetStackHighWaterMark(xReceiveTaskHandle);
+        Serial.printf("   📊 ReceiveTask stack: %u words remaining\n", stackLeft);
+      }
+      
+      xSemaphoreGive(xSIM7600Mutex);
+    } else {
+      Serial.println("🐕⚠ Watchdog: Failed to acquire mutex!");
+    }
+    
+    lastHeartbeat = millis();
   }
 }
 

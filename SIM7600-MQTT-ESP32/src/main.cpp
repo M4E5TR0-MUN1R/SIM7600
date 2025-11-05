@@ -452,6 +452,21 @@ bool setupMQTT() {
     Serial.println("⚠ Client acquisition response unclear, continuing...");
   }
   
+  // Configure MQTT receive mode - enable unsolicited result codes
+  Serial.println("Configuring MQTT receive mode...");
+  
+  // Try setting receive mode (some firmware versions might not support this)
+  sendATCommand("AT+CMQTTCFG=\"recv/mode\",0,1", 3000);
+  if (response.indexOf("ERROR") != -1) {
+    Serial.println("⚠ CMQTTCFG not supported, using default mode");
+  }
+  vTaskDelay(pdMS_TO_TICKS(500));
+  
+  // Query current receive mode for verification
+  Serial.println("Checking receive mode...");
+  sendATCommand("AT+CMQTTCFG?", 3000);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  
   Serial.println("✓ MQTT configuration complete\n");
   return true;
 }
@@ -482,18 +497,66 @@ bool connectMQTT() {
   }
   vTaskDelay(pdMS_TO_TICKS(2000));
   
-  // Subscribe - matching tutorial approach
-  Serial.printf("Subscribing to: %s\n", test_topic_sub);
-  snprintf(cmd, sizeof(cmd), "AT+CMQTTSUB=0,\"%s\",1", test_topic_sub);
-  sendATCommand(cmd, 5000);
+  // Unsubscribe any existing subscription first (clean slate)
+  Serial.println("Clearing any old subscriptions...");
+  sendATCommand("AT+CMQTTUNSUB=0", 3000);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  
+  // Subscribe - using tutorial 2 method (CMQTTSUBTOPIC first)
+  Serial.printf("Setting up subscription topic: %s\n", test_topic_sub);
+  
+  int topicLen = strlen(test_topic_sub);
+  
+  // Step 1: Set topic length and QoS
+  snprintf(cmd, sizeof(cmd), "AT+CMQTTSUBTOPIC=0,%d,1", topicLen);
+  sendATCommand(cmd, 3000);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  
+  // Step 2: Send the actual topic string
+  SIM7600.println(test_topic_sub);
+  Serial.printf(">> %s\n", test_topic_sub);
+  vTaskDelay(pdMS_TO_TICKS(1000));
+  
+  // Read response
+  response = "";
+  unsigned long start = millis();
+  while (millis() - start < 2000) {
+    while (SIM7600.available()) {
+      char c = SIM7600.read();
+      response += c;
+      Serial.print(c);
+    }
+    if (response.indexOf("OK") != -1 || response.indexOf("ERROR") != -1) break;
+  }
+  Serial.println();
+  
+  // Step 3: Actually subscribe (QoS 1, no retain)
+  Serial.println("Subscribing to topic...");
+  sendATCommand("AT+CMQTTSUB=0", 5000);
   vTaskDelay(pdMS_TO_TICKS(2000));
   
-  // Check subscription (error 12 might occur if topic format is wrong)
-  if (response.indexOf("+CMQTTSUB: 0,0") != -1) {
+  // Check subscription
+  if (response.indexOf("+CMQTTSUB: 0,0") != -1 || response.indexOf("OK") != -1) {
     Serial.println("✓ Subscribed successfully!");
   } else if (response.indexOf("+CMQTTSUB: 0,12") != -1) {
     Serial.println("⚠ Subscription error 12 (topic format issue?), but continuing...");
+  } else if (response.indexOf("+CMQTTSUB: 0,11") != -1) {
+    Serial.println("⚠ Subscription error 11 (not connected to broker?)");
+  } else {
+    Serial.println("⚠ Subscription response unclear");
+    Serial.println(response);
   }
+  
+  // Print test instructions
+  Serial.println("\n╔══════════════════════════════════════════════════════╗");
+  Serial.println("║  📨 MQTT RECEIVE TEST                               ║");
+  Serial.println("╚══════════════════════════════════════════════════════╝");
+  Serial.printf("   Subscribed to: %s\n", test_topic_sub);
+  Serial.printf("   Publishing to: %s\n", test_topic_pub);
+  Serial.println("\n   To test receive, publish a message to:");
+  Serial.printf("   Topic: %s\n", test_topic_sub);
+  Serial.println("   Example: \"Hello SIM7600!\"");
+  Serial.println("   Use your MQTT client or Shiftr.io web interface\n");
   
   Serial.println("✓ MQTT setup complete\n");
   return true;
@@ -532,35 +595,68 @@ void publishMessage(const char* topic, const char* message) {
 }
 
 void checkIncomingMessages() {
-  // Check for MQTT subscription messages
-  // Format: +CMQTTRXSTART: <client_index>,<topic_len>,<payload_len>
-  //         +CMQTTRXTOPIC: 0,<topic_length>
-  //         <topic_data>
-  //         +CMQTTRXPAYLOAD: 0,<payload_length>
-  //         <payload_data>
-  //         +CMQTTRXEND: <client_index>
+  // Check for ANY data from SIM7600 (MQTT messages, URCs, etc.)
+  // We're now receiving MQTT messages! Format:
+  // +CMQTTRXSTART: 0,<topic_len>,<payload_len>
+  // +CMQTTRXTOPIC: 0,<length>
+  // <actual topic string>              ← We need to catch this!
+  // +CMQTTRXPAYLOAD: 0,<length>
+  // <actual payload data>              ← And this!
+  // +CMQTTRXEND: 0
   
-  if (SIM7600.available()) {
-    String incoming = SIM7600.readStringUntil('\n');
+  static String rxBuffer = "";
+  static bool inMqttMessage = false;  // Track if we're inside an MQTT message
+  
+  // Read all available data
+  while (SIM7600.available()) {
+    char c = SIM7600.read();
+    rxBuffer += c;
     
-    if (incoming.indexOf("+CMQTTRXTOPIC:") != -1 || 
-        incoming.indexOf("+CMQTTRXPAYLOAD:") != -1 ||
-        incoming.indexOf("+CMQTTRXSTART:") != -1) {
-      Serial.println("\n📨 Incoming MQTT message:");
-      Serial.println(incoming);
+    // Check if we have a complete line
+    if (c == '\n') {
+      String line = rxBuffer;
+      line.trim();
       
-      // Continue reading related lines
-      vTaskDelay(pdMS_TO_TICKS(100));
-      while (SIM7600.available()) {
-        String line = SIM7600.readStringUntil('\n');
+      // Detect start of MQTT message
+      if (line.indexOf("+CMQTTRXSTART") != -1) {
+        inMqttMessage = true;
+        Serial.println("\n📨 ===== INCOMING MQTT MESSAGE =====");
         Serial.println(line);
-        if (line.indexOf("+CMQTTRXEND:") != -1) {
-          break;
+      }
+      // Detect end of MQTT message
+      else if (line.indexOf("+CMQTTRXEND") != -1) {
+        Serial.println(line);
+        Serial.println("📨 ===== END OF MESSAGE =====\n");
+        inMqttMessage = false;
+      }
+      // Show ALL lines when inside MQTT message (including data!)
+      else if (inMqttMessage && line.length() > 0) {
+        // This is either a header or actual data
+        if (line.startsWith("+CMQTTRX")) {
+          Serial.println(line);  // Header line
+        } else {
+          // This is the actual topic or payload data!
+          Serial.println("   📩 DATA: " + line);
         }
       }
+      // Check for other MQTT receive indicators
+      else if (line.indexOf("CMQTTRX") != -1 || 
+               line.indexOf("PAYLOAD") != -1) {
+        Serial.println("📨 MQTT RX: " + line);
+      }
+      // Show other unsolicited result codes
+      else if (line.startsWith("+") && line.length() > 1) {
+        Serial.println("📡 URC: " + line);
+      }
       
-      Serial.println();
+      rxBuffer = "";
     }
+  }
+  
+  // If buffer gets too large without newline, print and clear
+  if (rxBuffer.length() > 512) {
+    Serial.println("📨 MQTT RX (buffer): " + rxBuffer);
+    rxBuffer = "";
   }
 }
 

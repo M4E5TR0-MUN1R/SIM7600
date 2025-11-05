@@ -1,0 +1,13 @@
+Safaricom Kenya APN Configuration
+==================================
+
+Network Name: Safaricom internet
+APN: safaricom
+Username: saf
+Password: data
+Authentication: PAP
+
+AT Commands:
+AT+CGDCONT=1,"IP","safaricom"
+AT+CGAUTH=1,1,"saf","data"
+AT+CGACT=1,1

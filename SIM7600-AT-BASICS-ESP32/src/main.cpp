@@ -129,7 +129,7 @@ void setup() {
   
   // Send SMS
   Serial.println("\n=== Sending SMS ===");
-  sendSMS("+254729399246", "Hello from ESP32 and SIM7600!");
+  sendSMS("+254729399246", "Hello from ESP32-S3 and SIM7600!");
   
   smsSent = true;
   

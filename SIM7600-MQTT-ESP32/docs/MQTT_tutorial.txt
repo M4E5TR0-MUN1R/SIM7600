@@ -1,0 +1,172 @@
+/**
+ * @file ESP32-SIM7600-MQTT.ino
+ * @author Tanmoy Dutta (tanmoy.dutta@gmail.com)
+ * @brief Sketch for IBM IoT MQTT connection demo using SIM7600 4G modem
+ * @version 0.1
+ * @date 2022-02-22
+ * 
+ * @copyright Copyright (c) 2022
+ * 
+ */
+#include <HardwareSerial.h>
+
+/************************* PIN DEFINITIONS *********************************/
+#define MODEM_PWRKEY              25
+#define MODEM_RST                 4
+#define MODEM_TX                  26
+#define MODEM_RX                  27
+/************************* /PIN DEFINITIONS *********************************/
+
+/****************************** MQTT Creds ***************************************/
+String ORG = "<ORG ID of the IBM IoT instance>";
+String DEVICE_ID = "<Registered Device Id>";
+String DEVICE_TYPE = "<Device Type>";
+String TOKEN = "<Authentication Token>";
+String PROTOCOL_PREFIX = "tcp://"; //URL Prefix as required by SIM7600 module
+String PORT = "8883"; //Secure port
+
+String server_url = PROTOCOL_PREFIX + ORG + ".messaging.internetofthings.ibmcloud.com" + ":" + PORT;
+String topic = "iot-2/evt/status/fmt/json"; //We are publishing data in JSON format
+String authMethod = "use-token-auth"; //This is fixed for device authentication
+String token = TOKEN;
+
+String clientId = "d:" + ORG + ":" + DEVICE_TYPE + ":" + DEVICE_ID;
+/****************************** /MQTT Creds ***************************************/
+
+
+
+/**
+ * @brief Send the AT command to SIM7600
+ * and capture the response 
+ * 
+ * @param command 
+ */
+void serialCommand(String command){
+  Serial.print("Command:");Serial.println(command);
+  Serial2.println(command);
+
+  char dat;
+  while (Serial2.available()) {
+     dat = Serial2.read();
+     Serial.print(dat);
+     delay(10);
+     
+  }   
+  
+  Serial.println(dat); //Print the command response
+}
+
+/**
+ * @brief Connection command to MQTT Server
+ * 
+ */
+void mqttConnect() {
+  Serial.println("Check modem status...");
+  serialCommand("ATE0");
+  delay(10);
+  Serial.println("done!");
+
+  Serial.println("MQTT Start...");
+  serialCommand("AT+CMQTTSTART");
+  delay(100);
+  Serial.println("done!");
+
+  Serial.println("Configure client id...");
+  serialCommand("AT+CMQTTACCQ=0,\"" + clientId + "\",1");
+  delay(500);
+  Serial.println("done!");
+  
+  Serial.println("Open MQTT connection...");
+  serialCommand("AT+CMQTTCONNECT=0,\"" + server_url + "\",90,1,\"" + authMethod + "\",\"" + token + "\"");
+  delay(5000); //Allow sufficient time for the SSL handshake to finish
+  Serial.println("done!");
+
+}
+
+
+/**
+ * @brief Sequence of commands to send the data
+ * 
+ * @param dat 
+ */
+void sendMQTTData(String dat) {
+
+  serialCommand("AT+CMQTTTOPIC=0,25"); //Length of the topic string
+  delay(20);
+
+  serialCommand(topic);
+  delay(10);
+
+  serialCommand("AT+CMQTTPAYLOAD=0,200"); //Length of the payload
+  delay(20);
+
+  serialCommand("{\"d\":{\"a\":" + dat + "}}");
+  delay(20);
+
+  serialCommand("AT+CMQTTPUB=0,0,60"); //Publish to the server
+  delay(10);
+
+}
+
+/**
+ * @brief Disconnect the client from MQTT Server and 
+ * release the client
+ * 
+ */
+void mqttDisconnect() {
+  Serial.println("Diconnect MQTT...");
+  serialCommand("AT+CMQTTDISC=0,60"); //Disconnect Server
+  delay(2000);
+  Serial.println("done!");
+
+  Serial.println("Release client...");
+  serialCommand("AT+CMQTTREL=0"); //Release Client
+  delay(2000);
+  Serial.println("done!");
+
+  Serial.println("Stop MQTT...");
+  serialCommand("AT+CMQTTSTOP"); //Stop 4G connection
+  delay(2000);
+  Serial.println("done!");
+
+}
+
+/**
+ * @brief Initialise the peripherals and modem
+ * 
+ */
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(115200, SERIAL_8N1, MODEM_TX, MODEM_RX); //Setup Serial link with the Modem
+    
+  pinMode(MODEM_RST, OUTPUT);
+  digitalWrite(MODEM_RST, HIGH); // Default state
+
+  pinMode(MODEM_PWRKEY, OUTPUT);
+  digitalWrite(MODEM_PWRKEY, LOW);
+  delay(1000);
+  digitalWrite(MODEM_PWRKEY, HIGH);
+
+  digitalWrite(MODEM_RST, HIGH);
+  delay(10);
+  digitalWrite(MODEM_RST, LOW);
+  delay(10);
+  digitalWrite(MODEM_RST, HIGH);
+
+  Serial.println("Modem init called.");
+  Serial.println("Waiting 20 seconds...");
+  delay(20000); //And now we allow time for the modem to start up and initialise
+
+  mqttConnect();
+  
+  sendMQTTData("1");
+
+  mqttDisconnect();
+}
+
+/**
+ * @brief Do nothing in the loop
+ * 
+ */
+void loop() {
+}
